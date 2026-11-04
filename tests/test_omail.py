@@ -80,6 +80,17 @@ class TestProxyEnv(unittest.TestCase):
         self.assertEqual(r, 'NONE')
 
 
+class TestSSLContext(unittest.TestCase):
+    def setUp(self):
+        self.m = load_module()
+
+    def test_explicit_ssl_cert_file_is_respected(self):
+        with mock.patch.dict(os.environ, {'SSL_CERT_FILE': '/tmp/custom-ca.pem'}), \
+                mock.patch.object(self.m.ssl, 'create_default_context') as create:
+            self.m.ssl_context()
+        create.assert_called_once_with()
+
+
 class TestTenantDiscovery(unittest.TestCase):
     def setUp(self):
         self.m = load_module()
@@ -175,6 +186,22 @@ class TestValidation(unittest.TestCase):
         self.assertEqual(ev['Start']['TimeZone'], 'China Standard Time')
         self.assertEqual(ev['Attendees'][0]['EmailAddress']['Address'],
                          'a@b.com')
+
+    def test_body_max_zero_is_valid(self):
+        with mock.patch.object(self.m, 'api_json', return_value={
+                'Body': {'ContentType': 'Text', 'Content': 'hello'},
+                'ToRecipients': [], 'CcRecipients': []}):
+            out = capture(self.m.cmd_read, 'tok', {'id': 'MID', 'body_max': '0'})
+        data = json.loads(out)
+        self.assertEqual(data['body_text'], '')
+        self.assertTrue(data['body_truncated'])
+
+    def test_body_max_rejects_negative(self):
+        with mock.patch.object(self.m, 'api_json', return_value={
+                'Body': {'ContentType': 'Text', 'Content': 'hello'}}):
+            with self.assertRaises(SystemExit) as cm:
+                self.m.cmd_read('tok', {'id': 'MID', 'body_max': '-1'})
+        self.assertEqual(cm.exception.code, 64)
 
 
 class TestDryRun(unittest.TestCase):

@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.2.1 (2026-11-04)
+
+- **Portable TLS certificates**: use an optional `certifi` CA bundle when the Python installation has no usable default bundle; explicit `SSL_CERT_FILE` / `SSL_CERT_DIR` settings remain respected.
+- **`--body-max` edge cases**: `read --body-max 0` now returns an empty body with `body_truncated: true`; negative and non-numeric values return a clear usage error.
+- **CI**: run the offline test suite on Ubuntu, macOS, and Windows across supported Python versions.
+
 ## v1.2.0 (2026-11-04)
 
 - **Automatic pagination**: `list` / `search` / `folders` / `calendar` / `calendars` follow `@odata.nextLink` until the requested total is collected — no more silent truncation at one server page.

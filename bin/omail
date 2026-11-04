@@ -48,6 +48,11 @@ import sys
 import time
 import urllib.parse
 
+try:
+    import certifi  # optional: use a maintained CA bundle when available
+except ImportError:
+    certifi = None
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Token store: $OMAIL_HOME/token_store.json, else a store sitting next to
 # the package (installed instances), else ~/.omail/token_store.json.
@@ -127,6 +132,21 @@ class AmbiguousError(Exception):
     so the caller must verify first."""
 
 
+def ssl_context():
+    """Build a verifying TLS context with portable CA-bundle fallbacks.
+
+    The standard-library context is preferred. Some Python distributions,
+    notably framework builds on macOS, ship without a usable CA bundle;
+    when the optional certifi package is present, use it in that case.
+    SSL_CERT_FILE/SSL_CERT_DIR remain respected by ssl itself.
+    """
+    if certifi and not os.environ.get('SSL_CERT_FILE'):
+        default = ssl.get_default_verify_paths().cafile
+        if not default or not os.path.exists(default):
+            return ssl.create_default_context(cafile=certifi.where())
+    return ssl.create_default_context()
+
+
 def https(host, method, path, body=None, headers=None, attempts=5,
           safe_retry=True):
     """One HTTP round trip.
@@ -147,7 +167,7 @@ def https(host, method, path, body=None, headers=None, attempts=5,
     for _ in range(attempts):
         sent = False
         try:
-            ctx = ssl.create_default_context()
+            ctx = ssl_context()
             if _pu.hostname:  # via egress proxy: CONNECT tunnel
                 conn = http.client.HTTPSConnection(_pu.hostname, _pu.port,
                                                    timeout=30, context=ctx)
@@ -468,8 +488,13 @@ def cmd_read(token, args):
     if (m.get('Body') or {}).get('ContentType') == 'HTML':
         body = re.sub(r'<[^>]+>', ' ', body)
         body = re.sub(r'\s+', ' ', body)
-    if args.get('body_max'):
-        limit = int(args['body_max'])
+    if args.get('body_max') is not None:
+        try:
+            limit = int(args['body_max'])
+        except (TypeError, ValueError):
+            usage('--body-max must be a non-negative integer')
+        if limit < 0:
+            usage('--body-max must be a non-negative integer')
         if len(body) > limit:
             body = body[:limit]
             truncated = True

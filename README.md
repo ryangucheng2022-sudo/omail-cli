@@ -8,8 +8,10 @@ A single-file, zero-dependency command-line tool for Microsoft 365 mailboxes: fu
 
 ## Requirements
 
-- Python 3.9+ (standard library only, nothing to pip install)
+- Python 3.9+ (standard library only; `certifi` is optional and used when a Python distribution lacks a CA bundle)
 - Network access to your cloud's sign-in and API endpoints (honours `https_proxy` / `HTTPS_PROXY` if set)
+
+If sign-in fails with a local certificate verification error, set `SSL_CERT_FILE` to a trusted CA bundle. When the optional `certifi` package is installed, `omail` uses it automatically if the Python installation has no usable default CA bundle.
 
 ## Quick start
 
@@ -79,7 +81,7 @@ python3 -m unittest discover -s tests -v   # 28 tests, fully offline, no account
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Current version: **v1.2.0**.
+See [CHANGELOG.md](CHANGELOG.md). Current version: **v1.2.1**.
 
 ## License
 
