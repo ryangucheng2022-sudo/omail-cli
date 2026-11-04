@@ -383,5 +383,82 @@ class TestBodyMax(unittest.TestCase):
         self.assertFalse(d['body_truncated'])
 
 
+
+class TestContactsFind(unittest.TestCase):
+    def setUp(self):
+        self.m = load_module()
+        self.raw_contact = {
+            'DisplayName': '暾 李', 'GivenName': '暾', 'Surname': '李',
+            'EmailAddresses': [{'Name': 'alice.lee@convenientpower.com',
+                                'Address': 'alice.lee@convenientpower.com'}],
+            'CompanyName': 'ConvenientPower', 'JobTitle': 'Manager',
+            'Department': 'BD'}
+
+    def test_contact_view_maps_fields(self):
+        v = self.m.contact_view(self.raw_contact)
+        self.assertEqual(v['name'], '暾 李')
+        self.assertEqual(v['emails'][0]['address'],
+                         'alice.lee@convenientpower.com')
+        self.assertEqual(v['source'], 'contacts')
+
+    def test_people_view_maps_scored_emails(self):
+        v = self.m.people_view({
+            'DisplayName': '陆杰',
+            'ScoredEmailAddresses': [{'Address': 'jenny.lu@bpsemi.com'}]})
+        self.assertEqual(v['emails'][0]['address'], 'jenny.lu@bpsemi.com')
+        self.assertEqual(v['source'], 'directory')
+
+    def test_matches_reversed_cjk_name_and_email(self):
+        v = self.m.contact_view(self.raw_contact)
+        self.assertTrue(self.m._matches(v, '李暾'))
+        self.assertTrue(self.m._matches(v, 'alice.lee'))
+        self.assertFalse(self.m._matches(v, '张博一'))
+
+    def test_matches_no_charset_false_positive_for_latin_query(self):
+        other = self.m.contact_view({
+            'DisplayName': '', 'EmailAddresses': [
+                {'Address': 'yiling.tang@convenientpower.com'}]})
+        self.assertFalse(self.m._matches(other, 'alice.lee'))
+
+    def test_top_value_rejects_bad_input(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.m._top_value({'top': '0'}, 20)
+        self.assertEqual(cm.exception.code, 64)
+
+    def test_merge_directory_and_contacts(self):
+        d = self.m.people_view({
+            'DisplayName': '李暾',
+            'ScoredEmailAddresses': [{'Address': 'alice.lee@x.com'}]})
+        c = self.m.contact_view({
+            'DisplayName': '暾 李',
+            'EmailAddresses': [{'Address': 'alice.lee@x.com'}],
+            'CompanyName': 'ACME'})
+        out = self.m._merge_people_contacts([d], [c])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]['sources'], ['directory', 'contacts'])
+        self.assertEqual(out[0]['company'], 'ACME')
+
+    def test_cmd_contacts_search_filters_locally(self):
+        with mock.patch.object(self.m, 'fetch_contacts',
+                               return_value=[self.raw_contact]):
+            out = capture(self.m.cmd_contacts, 'tok', {'search': '李暾'})
+        d = json.loads(out)
+        self.assertEqual(len(d), 1)
+        self.assertEqual(d[0]['name'], '暾 李')
+
+    def test_cmd_find_merges_people_and_contacts(self):
+        person = self.m.people_view({
+            'DisplayName': '陆杰',
+            'ScoredEmailAddresses': [{'Address': 'jenny.lu@bpsemi.com'}]})
+        with mock.patch.object(self.m, 'search_people',
+                               return_value=[person]), \
+                mock.patch.object(self.m, 'fetch_contacts',
+                                  return_value=[]):
+            out = capture(self.m.cmd_find, 'tok', {'keyword': '陆杰'})
+        d = json.loads(out)
+        self.assertEqual(d[0]['emails'][0]['address'], 'jenny.lu@bpsemi.com')
+        self.assertEqual(d[0]['sources'], ['directory'])
+
+
 if __name__ == '__main__':
     unittest.main()

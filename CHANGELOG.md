@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.2.2 (2026-11-04)
+
+- **New read-only commands `contacts` / `find`**: `contacts [--search KW] [--top N]` lists personal contacts (`/me/contacts`; name/email/company/title/department — phone fields are not selectable in REST v2.0 and return HTTP 400). `find KEYWORD [--top N]` looks people up in the global address book (`/me/people?$search=`) and merges personal-contact matches, tagging each result with its `sources`; an unquoted retry covers tenants that reject the quoted search form. Contact matching tolerates CJK surname/given-name ordering (a contact shown as "given-name surname" is found by "surname given-name"); the character-set fallback is restricted to short CJK names so Latin queries do not false-positive.
+- **Tests**: 39 offline cases (8 new for contacts/find views, matching, merging, and argument guards).
+
+
 ## v1.2.1 (2026-11-04)
 
 - **Portable TLS certificates**: use an optional `certifi` CA bundle when the Python installation has no usable default bundle; explicit `SSL_CERT_FILE` / `SSL_CERT_DIR` settings remain respected.
