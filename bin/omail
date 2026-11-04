@@ -18,6 +18,9 @@ Subcommands (reads print JSON; writes print a JSON result):
   digest SINCE_ISOZ            morning-digest JSON (new unread + totals)
   calendar [--days N]          events in window (calendarview)
   calendars                    calendar list (id/name/editable)
+  contacts [--search KW] [--top N]
+                               personal contacts (name/email/company/title)
+  find KEYWORD [--top N]       search global address book + personal contacts
   event ID                     one calendar event
   event-create --subject S --start ISO --end ISO [--tz WIN_TZ]
                [--location L] [--body B|--body-file F]
@@ -592,6 +595,158 @@ def cmd_calendars(token, args):
                      ensure_ascii=False, indent=1))
 
 
+
+CONTACT_SEL = ('DisplayName,GivenName,Surname,EmailAddresses,CompanyName,'
+               'JobTitle,Department')
+PEOPLE_SEL = ('DisplayName,ScoredEmailAddresses,CompanyName,JobTitle,'
+              'Department')
+
+
+def _top_value(args, default):
+    raw = args.get('top', default)
+    try:
+        top = int(raw)
+    except Exception:
+        usage('--top must be a positive integer')
+    if top <= 0:
+        usage('--top must be a positive integer')
+    return top
+
+
+def _email_objects(entries):
+    out = []
+    for e in entries or []:
+        if isinstance(e, dict):
+            out.append({'name': e.get('Name'), 'address': e.get('Address')})
+        elif e:
+            out.append({'name': None, 'address': e})
+    return out
+
+
+def contact_view(c, source='contacts'):
+    return {'name': c.get('DisplayName'),
+            'given_name': c.get('GivenName'), 'surname': c.get('Surname'),
+            'emails': _email_objects(c.get('EmailAddresses')),
+            'company': c.get('CompanyName'), 'title': c.get('JobTitle'),
+            'department': c.get('Department'), 'source': source}
+
+
+def people_view(p, source='directory'):
+    return {'name': p.get('DisplayName'), 'given_name': None,
+            'surname': None,
+            'emails': _email_objects(p.get('ScoredEmailAddresses')),
+            'company': p.get('CompanyName'), 'title': p.get('JobTitle'),
+            'department': p.get('Department'), 'source': source}
+
+
+def _compact(text):
+    return re.sub(r'\s+', '', (text or '').lower())
+
+
+def _matches(view, keyword):
+    kw = (keyword or '').strip().lower()
+    kwc = _compact(keyword)
+    if not kw:
+        return False
+    fields = [(view.get('name'), True), (view.get('company'), False),
+              (view.get('title'), False), (view.get('department'), False)]
+    for e in view.get('emails', []):
+        fields.extend([(e.get('address'), False), (e.get('name'), True)])
+    cjk_query = bool(re.search(r'[\u4e00-\u9fff]', kwc))
+    for f, is_name in fields:
+        if not f:
+            continue
+        fl = f.lower()
+        fc = _compact(f)
+        if kw in fl or (kwc and (kwc in fc or fc in kwc)):
+            return True
+        # Outlook often displays CJK names as "given-name surname" while
+        # users search "surname given-name"; for CJK name fields only,
+        # accept the same character set as a candidate match.
+        if (is_name and cjk_query and 2 <= len(kwc) <= 4 and len(fc) <= 8
+                and all(ch in fc for ch in kwc)):
+            return True
+    return False
+
+
+def fetch_contacts(token, limit=None):
+    q = urllib.parse.urlencode({'$top': 100, '$select': CONTACT_SEL})
+    return api_paged('%s/me/contacts?%s' % (API, q), token, limit=limit)
+
+
+def cmd_contacts(token, args):
+    top = _top_value(args, 100)
+    if args.get('search'):
+        views = [contact_view(c) for c in fetch_contacts(token)]
+        views = [v for v in views if _matches(v, args['search'])]
+    else:
+        views = [contact_view(c) for c in fetch_contacts(token, limit=top)]
+    print(json.dumps(views[:top], ensure_ascii=False, indent=1))
+
+
+def search_people(token, keyword, top):
+    kw = keyword.replace('"', '').strip()
+    base = {'$top': min(top, 100), '$select': PEOPLE_SEL}
+    q = urllib.parse.urlencode(dict(base, **{'$search': '"%s"' % kw}))
+    try:
+        return [people_view(p) for p in api_paged(
+            '%s/me/people?%s' % (API, q), token, limit=top)]
+    except ApiError as e:
+        if e.status != 400:
+            raise
+        # Some tenants reject the quoted form for e-mail-prefix queries;
+        # retry the same read unquoted before giving up.
+        q = urllib.parse.urlencode(dict(base, **{'$search': kw}))
+        return [people_view(p) for p in api_paged(
+            '%s/me/people?%s' % (API, q), token, limit=top)]
+
+
+def _merge_people_contacts(people, contacts):
+    merged = []
+    index = {}
+    for v in people + contacts:
+        keys = [e['address'].lower() for e in v.get('emails', [])
+                if e.get('address')]
+        if not keys and v.get('name'):
+            keys = ['name:' + _compact(v['name'])]
+        found = None
+        for k in keys:
+            if k in index:
+                found = index[k]
+                break
+        if found is None:
+            nv = dict(v)
+            nv['sources'] = [v.get('source')]
+            nv.pop('source', None)
+            merged.append(nv)
+            found = nv
+            for k in keys:
+                index[k] = nv
+        else:
+            src = v.get('source')
+            if src and src not in found['sources']:
+                found['sources'].append(src)
+            for field in ('name', 'given_name', 'surname', 'company',
+                          'title', 'department'):
+                if not found.get(field) and v.get(field):
+                    found[field] = v[field]
+            existing = {e.get('address', '').lower()
+                        for e in found.get('emails', [])}
+            for e in v.get('emails', []):
+                if e.get('address', '').lower() not in existing:
+                    found.setdefault('emails', []).append(e)
+    return merged
+
+
+def cmd_find(token, args):
+    keyword = args['keyword'].strip()
+    top = _top_value(args, 20)
+    people = search_people(token, keyword, top)
+    contacts = [contact_view(c) for c in fetch_contacts(token)]
+    contacts = [v for v in contacts if _matches(v, keyword)]
+    out = _merge_people_contacts(people, contacts)
+    print(json.dumps(out[:top], ensure_ascii=False, indent=1))
+
 def _event_dt(value, tz):
     return {'DateTime': value, 'TimeZone': tz}
 
@@ -943,6 +1098,11 @@ def main():
             cmd_event(token, opts)
         elif cmd == 'calendars':
             cmd_calendars(token, opts)
+        elif cmd == 'contacts':
+            cmd_contacts(token, opts)
+        elif cmd == 'find':
+            opts['keyword'] = ' '.join(need_pos(pos, 1, 'find keyword'))
+            cmd_find(token, opts)
         elif cmd == 'event-create':
             cmd_event_create(token, opts)
         elif cmd == 'event-update':
