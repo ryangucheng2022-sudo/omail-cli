@@ -47,6 +47,8 @@ bin/omail doctor   # 自检：输出你的账号与收件箱计数即通
 | `attachments <id>` / `attachment-get <id> <附件Id> <路径>` | 附件列表 / 下载 |
 | `digest <ISO时间>` | 某时间点之后的新增未读（晨间摘要场景） |
 | `calendar [--days N]` / `calendars` / `event <id>` | 日程窗口 / 日历列表 / 单个日程（时间为 UTC） |
+| `contacts [--search KW] [--top N]` | 个人通讯录（姓名/邮箱/公司/职位/部门；不支持电话字段） |
+| `find 关键词 [--top N]` | 查人：全局地址簿搜索＋个人通讯录匹配合并（带 `sources` 来源标注）；中文全名在目录侧偶有漏检，按邮箱前缀最可靠 |
 
 写（不可逆，自动化场景请先经人工确认）：
 
@@ -83,12 +85,12 @@ bin/omail doctor   # 自检：输出你的账号与收件箱计数即通
 ## 测试
 
 ```bash
-python3 -m unittest discover -s tests -v   # 28 个用例，全离线，不需要账号
+python3 -m unittest discover -s tests -v   # 39 个用例，全离线，不需要账号
 ```
 
 ## 版本
 
-完整变更记录见 [CHANGELOG.md](CHANGELOG.md)。当前版本 **v1.2.0**。
+完整变更记录见 [CHANGELOG.md](CHANGELOG.md)。当前版本 **v1.2.2**。
 
 ## 许可证
 

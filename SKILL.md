@@ -17,7 +17,7 @@ Tool: `bin/omail` (single-file Python, standard library only). Read the bundled 
 - **Before any write, restate it in full and get the user's confirmation**: `send` (recipients/cc/subject/body summary/attachment list), `reply`, `delete`, `move`, batch `mark`, and the calendar writes `event-create` / `event-update` / `event-delete` (subject/time/location/attendees). Exception: a single `mark` the user explicitly named in the same instruction may run directly. Running `--dry-run` first to produce a normalised preview for the user is encouraged.
 - **Creating an event with attendees sends them invitations**; deleting such an event sends cancellations. Treat both like sending mail — confirm first.
 - On `ambiguous_outcome` (exit code 3), **never blindly re-run**: verify whether the write landed (Sent Items / calendar) and only then retry with `--force`. The same applies when the idempotency journal blocks a duplicate `send`/`event-create`.
-- Read-only commands (doctor/folders/list/search/read/attachments/digest/calendar/calendars/event) may run without asking.
+- Read-only commands (doctor/folders/list/search/read/attachments/digest/calendar/calendars/event/contacts/find) may run without asking. Use `find <name or e-mail prefix>` for people lookup (global address book + personal contacts, `sources`-tagged); use `contacts` to list personal contacts.
 - For digests/summaries use metadata + preview only; do not open full bodies.
 - The token file `token_store.json` is password-equivalent: never print it, paste it, or include it in reports.
 

@@ -38,6 +38,8 @@ Read-only:
 | `attachments <id>` / `attachment-get <id> <attId> <path>` | List / download attachments |
 | `digest <ISO-time>` | Unread mail since a timestamp (built for morning digests) |
 | `calendar [--days N]` / `calendars` / `event <id>` | Calendar window / calendar list / one event (times in UTC) |
+| `contacts [--search KW] [--top N]` | Personal contacts (name/email/company/title/department; no phone fields) |
+| `find KEYWORD [--top N]` | People lookup: global address book search merged with personal contacts (results carry a `sources` tag); CJK full names occasionally miss in the directory — an e-mail prefix is the most reliable query |
 
 Writes (irreversible — confirm before running in automation):
 
@@ -76,12 +78,12 @@ All output is JSON. List commands follow `@odata.nextLink` automatically, so lar
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 28 tests, fully offline, no account needed
+python3 -m unittest discover -s tests -v   # 39 tests, fully offline, no account needed
 ```
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Current version: **v1.2.1**.
+See [CHANGELOG.md](CHANGELOG.md). Current version: **v1.2.2**.
 
 ## License
 
