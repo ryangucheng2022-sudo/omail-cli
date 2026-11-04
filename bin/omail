@@ -1,0 +1,964 @@
+#!/usr/bin/env python3
+"""omail - Outlook mailbox CLI (Outlook REST API v2.0, 21Vianet).
+
+Auth model: device-flow refresh token (Microsoft Office first-party
+client, scope https://partner.outlook.cn/.default), stored in
+../token_store.json (mode 600) and rotated on every refresh.
+Pure stdlib. HTTP goes through a manual CONNECT tunnel because
+urllib's proxy handling is unreliable behind some corporate egress proxies.
+
+Subcommands (reads print JSON; writes print a JSON result):
+  doctor                       token + mailbox health, no content
+  folders                      folder list with counts
+  list [--folder F] [--top N] [--unread] [--since ISOZ]
+  search KEYWORD [--top N]     subject/sender keyword search
+  read ID                      full message (text body + attachment meta)
+  attachments ID               attachment list for a message
+  attachment-get ID ATT OUT    download one attachment to OUT
+  digest SINCE_ISOZ            morning-digest JSON (new unread + totals)
+  calendar [--days N]          events in window (calendarview)
+  calendars                    calendar list (id/name/editable)
+  event ID                     one calendar event
+  event-create --subject S --start ISO --end ISO [--tz WIN_TZ]
+               [--location L] [--body B|--body-file F]
+               [--attendees a@x,b@y] [--calendar CAL_ID]
+  event-update ID [--subject S] [--start ISO] [--end ISO] [--tz WIN_TZ]
+               [--location L] [--body B|--body-file F] [--attendees ...]
+  event-delete ID              delete event (notifies attendees if any)
+  send --to A --subject S --body B [--cc C] [--body-file F]
+  reply ID --body B [--body-file F]
+  mark ID --read|--unread
+  move ID --folder NAME        folder display name or well-known id
+  delete ID                    move message to Deleted Items
+  reauth                       device-code re-authorisation (interactive)
+
+Notes: list/search/calendar follow @odata.nextLink automatically.
+Write commands accept --dry-run (validate + JSON preview, no API call).
+send / event-create are journal-guarded against duplicate submission
+(--force overrides). Writes are never blindly retried after sending:
+an unknown outcome exits 3 with error=ambiguous_outcome.
+"""
+import base64
+import http.client
+import json
+import os
+import re
+import ssl
+import sys
+import time
+import urllib.parse
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+# Token store: $OMAIL_HOME/token_store.json, else a store sitting next to
+# the package (installed instances), else ~/.omail/token_store.json.
+_sibling_store = os.path.join(HERE, '..', 'token_store.json')
+if os.environ.get('OMAIL_HOME'):
+    STORE = os.path.join(os.environ['OMAIL_HOME'], 'token_store.json')
+elif os.path.exists(_sibling_store):
+    STORE = _sibling_store
+else:
+    STORE = os.path.expanduser('~/.omail/token_store.json')
+CLIENT_ID = 'd3590ed6-52b3-4102-aeff-aad2292ab01c'  # Microsoft Office
+CLOUDS = {
+    '21vianet': {'auth_host': 'login.partner.microsoftonline.cn',
+                 'api_host': 'partner.outlook.cn',
+                 'resource': 'https://partner.outlook.cn'},
+    'global': {'auth_host': 'login.microsoftonline.com',
+               'api_host': 'outlook.office365.com',
+               'resource': 'https://outlook.office365.com'},
+}
+_cfg = {}
+
+
+def cfg():
+    """Runtime config from the token store (tenant/cloud/account)."""
+    if not _cfg:
+        try:
+            _cfg.update(load_store())
+        except Exception:
+            pass
+        _cfg.setdefault('cloud', '21vianet')
+    return _cfg
+
+
+def cloud():
+    return CLOUDS[cfg().get('cloud', '21vianet')]
+
+
+def auth_host():
+    return cloud()['auth_host']
+
+
+def api_host():
+    return cloud()['api_host']
+
+
+def tenant():
+    return cfg()['tenant']
+
+
+def scope():
+    return '%s/.default offline_access' % cloud()['resource']
+
+
+API = '/api/v2.0'
+
+_proxy_url = (os.environ.get('https_proxy') or os.environ.get('HTTPS_PROXY')
+              or os.environ.get('http_proxy') or os.environ.get('HTTP_PROXY')
+              or '')
+_pu = urllib.parse.urlparse(_proxy_url)
+_cred = None
+if _pu.username:
+    _cred = base64.b64encode(
+        ('%s:%s' % (urllib.parse.unquote(_pu.username),
+                    urllib.parse.unquote(_pu.password or ''))).encode()).decode()
+
+
+class ApiError(Exception):
+    def __init__(self, status, payload):
+        super().__init__('HTTP %s' % status)
+        self.status = status
+        self.payload = payload[:600] if isinstance(payload, bytes) else payload
+
+
+class AmbiguousError(Exception):
+    """A write request was sent but its outcome is unknown (transport
+    failure after sending). Retrying blindly could duplicate the write,
+    so the caller must verify first."""
+
+
+def https(host, method, path, body=None, headers=None, attempts=5,
+          safe_retry=True):
+    """One HTTP round trip.
+
+    Retry policy: failures while *connecting* are always retried (the
+    request never left). Failures after the request was sent are only
+    retried when safe_retry is true (reads / naturally idempotent
+    writes); otherwise AmbiguousError is raised so a write is never
+    silently duplicated by a retry.
+    """
+    hdrs = dict(headers or {})
+    if isinstance(body, (dict, list)):
+        body = json.dumps(body).encode()
+        hdrs.setdefault('Content-Type', ' application/json'.strip())
+    elif isinstance(body, str):
+        body = body.encode()
+    last = None
+    for _ in range(attempts):
+        sent = False
+        try:
+            ctx = ssl.create_default_context()
+            if _pu.hostname:  # via egress proxy: CONNECT tunnel
+                conn = http.client.HTTPSConnection(_pu.hostname, _pu.port,
+                                                   timeout=30, context=ctx)
+                th = {}
+                if _cred:
+                    th['Proxy-Authorization'] = 'Basic %s' % _cred
+                conn.set_tunnel(host, 443, th)
+            else:  # direct connection (normal user machines)
+                conn = http.client.HTTPSConnection(host, 443, timeout=30,
+                                                   context=ctx)
+            sent = True  # anything failing from here may have been sent
+            conn.request(method, path, body, hdrs)
+            resp = conn.getresponse()
+            payload = resp.read()
+            status = resp.status
+            conn.close()
+            if status >= 400:
+                raise ApiError(status, payload)
+            return status, payload
+        except ApiError:
+            raise
+        except Exception as exc:
+            if sent and not safe_retry:
+                raise AmbiguousError(
+                    '%s %s: request sent, outcome unknown (%r); verify '
+                    'before retrying' % (method, path.split('?')[0], exc))
+            last = exc
+            time.sleep(2)
+    raise last
+
+
+# ---------------------------------------------------------------- auth
+def load_store():
+    with open(STORE) as f:
+        return json.load(f)
+
+
+def save_store(data):
+    merged = {}
+    if os.path.exists(STORE):
+        try:
+            merged.update(load_store())
+        except Exception:
+            pass
+    merged.update(data)
+    os.makedirs(os.path.dirname(STORE), exist_ok=True)
+    with open(STORE, 'w') as f:
+        json.dump(merged, f)
+    os.chmod(STORE, 0o600)
+    _cfg.update(merged)
+
+
+def refresh(refresh_token):
+    body = urllib.parse.urlencode({
+        'grant_type': 'refresh_token', 'client_id': CLIENT_ID,
+        'refresh_token': refresh_token, 'scope': scope()})
+    status, payload = https(
+        auth_host(), 'POST', '/%s/oauth2/v2.0/token' % tenant(), body,
+        {'Content-Type': 'application/x-www-form-urlencoded'})
+    data = json.loads(payload)
+    if data.get('refresh_token'):
+        save_store({'refresh_token': data['refresh_token']})
+    return data['access_token']
+
+
+def access_token():
+    try:
+        return refresh(load_store()['refresh_token'])
+    except ApiError as e:
+        if b'invalid_grant' in e.payload or b'AADSTS' in e.payload:
+            sys.stderr.write(json.dumps({
+                'error': 'token_invalid',
+                'hint': 'run `omail auth --email <you@company.com>`',
+                'detail': e.payload.decode('utf-8', 'replace')[:300]}) + '\n')
+            sys.exit(2)
+        raise
+
+
+def api(method, path, token, body=None, headers=None, safe_retry=None):
+    hdrs = {'Authorization': 'Bearer %s' % token}
+    hdrs.update(headers or {})
+    if safe_retry is None:
+        safe_retry = method in ('GET', 'PATCH', 'HEAD')
+    return https(api_host(), method, path, body, hdrs,
+                 safe_retry=safe_retry)
+
+
+def api_json(method, path, token, body=None, headers=None, safe_retry=None):
+    status, payload = api(method, path, token, body, headers, safe_retry)
+    return json.loads(payload) if payload else {}
+
+
+def api_paged(path, token, limit=None, max_pages=50):
+    """GET a collection, following @odata.nextLink until `limit` items
+    are collected or the pages run out. Prevents silent truncation when
+    a result set exceeds one server page."""
+    items = []
+    url = path
+    for _ in range(max_pages):
+        data = api_json('GET', url, token)
+        items.extend(data.get('value', []))
+        if limit and len(items) >= limit:
+            return items[:limit]
+        nxt = data.get('@odata.nextLink')
+        if not nxt:
+            break
+        p = urllib.parse.urlparse(nxt)
+        url = p.path + (('?' + p.query) if p.query else '')
+    return items[:limit] if limit else items
+
+
+# ---------------------------------------------------------------- views
+def addr(e):
+    a = (e or {}).get('EmailAddress', {})
+    return {'name': a.get('Name'), 'address': a.get('Address')}
+
+
+def msg_view(m):
+    return {
+        'id': m.get('Id'),
+        'received': m.get('ReceivedDateTime'),
+        'from': addr(m.get('From')),
+        'subject': m.get('Subject'),
+        'is_read': m.get('IsRead'),
+        'has_attachments': m.get('HasAttachments'),
+        'preview': (m.get('BodyPreview') or '').replace('\r', ' ').replace('\n', ' ')[:160],
+    }
+
+
+SEL = 'Id,Subject,From,ReceivedDateTime,IsRead,BodyPreview,HasAttachments'
+
+
+def list_messages(token, folder='inbox', top=20, unread=False, since=None):
+    filters = []
+    if unread:
+        filters.append('IsRead eq false')
+    if since:
+        filters.append('ReceivedDateTime gt %s' % since)
+    q = {'$top': min(top, 100), '$select': SEL,
+         '$orderby': 'ReceivedDateTime desc'}
+    if filters:
+        q['$filter'] = ' and '.join(filters)
+    path = '%s/me/mailfolders/%s/messages?%s' % (
+        API, urllib.parse.quote(folder, safe=''),
+        urllib.parse.urlencode(q))
+    return api_paged(path, token, limit=top)
+
+
+def resolve_folder_id(token, name):
+    known = {'inbox', 'sentitems', 'deleteditems', 'drafts', 'archive',
+             'junkemail', 'outbox', 'clutter', 'scheduled'}
+    if name.lower() in known:
+        return name.lower()
+    for fo in api_paged('%s/me/mailfolders?$top=100' % API, token):
+        if fo.get('DisplayName') == name:
+            return fo['Id']
+    raise SystemExit('folder not found: %s' % name)
+
+
+# ---------------------------------------------------------------- validation
+EMAIL_RE = re.compile(r'^[^@\s,]+@[^@\s,]+$')
+
+
+def usage(msg):
+    sys.stderr.write(json.dumps({'error': 'usage', 'detail': msg}) + '\n')
+    sys.exit(64)
+
+
+def require(args, *keys):
+    missing = [k for k in keys if not args.get(k)]
+    if missing:
+        usage('missing required option(s): %s' % ', '.join(
+            '--' + k.replace('_', '-') for k in missing))
+
+
+def check_emails(spec, field):
+    addrs = [a.strip() for a in (spec or '').split(',') if a.strip()]
+    if not addrs:
+        usage('%s: no address given' % field)
+    bad = [a for a in addrs if not EMAIL_RE.match(a)]
+    if bad:
+        usage('%s: invalid email address(es): %s' % (field, ', '.join(bad)))
+    return addrs
+
+
+def parse_iso(value, field):
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except Exception:
+        usage('%s: not an ISO 8601 datetime: %r' % (field, value))
+
+
+def check_files(spec):
+    paths = []
+    for path in (spec or '').split(','):
+        path = path.strip()
+        if not path:
+            continue
+        if not os.path.isfile(path):
+            usage('attachment not found: %s' % path)
+        paths.append(path)
+    return paths
+
+
+def preview(action, detail):
+    print(json.dumps({'dry_run': True, 'action': action, 'detail': detail},
+                     ensure_ascii=False, indent=1))
+
+
+# ---------------------------------------------------------------- write journal
+def _journal_path():
+    return os.path.join(os.path.dirname(os.path.abspath(STORE)),
+                        'write_journal.json')
+
+
+def _journal_load():
+    try:
+        with open(_journal_path()) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _journal_save(data):
+    path = _journal_path()
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def journal_guard(op, payload, force=False):
+    """Client-side idempotency for send / event-create.
+
+    Refuses to repeat an identical write that is in-flight (started,
+    outcome unknown) or was completed moments ago, unless --force.
+    Returns a key to pass to journal_done() after the write succeeds.
+    """
+    import hashlib
+    canon = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    key = hashlib.sha256(('%s|%s' % (op, canon)).encode()).hexdigest()
+    now = time.time()
+    data = {k: v for k, v in _journal_load().items()
+            if now - v.get('ts', 0) < 86400}
+    prev = data.get(key)
+    if prev and not force and now - prev.get('ts', 0) < 600:
+        if prev.get('status') == 'done':
+            usage('duplicate write blocked: an identical %s completed '
+                  '%ds ago (idempotency journal); pass --force to send '
+                  'it anyway' % (op, int(now - prev['ts'])))
+        usage('possible duplicate: an identical %s was started %ds ago '
+              'but its outcome is unknown; verify first (Sent Items / '
+              'calendar), then pass --force if it really did not happen'
+              % (op, int(now - prev['ts'])))
+    data[key] = {'ts': now, 'status': 'started', 'op': op}
+    _journal_save(data)
+    return key
+
+
+def journal_done(key):
+    data = _journal_load()
+    if key in data:
+        data[key]['status'] = 'done'
+        data[key]['ts'] = time.time()
+        _journal_save(data)
+
+
+# ---------------------------------------------------------------- commands
+def cmd_doctor(token):
+    me = api_json('GET', '%s/me' % API, token)
+    inbox = api_json('GET', '%s/me/mailfolders/inbox' % API, token)
+    print(json.dumps({
+        'ok': True, 'account': (me.get('UserPrincipalName') or me.get('mail')
+                                or me.get('EmailAddress')),
+        'display_name': me.get('DisplayName'),
+        'inbox_total': inbox.get('TotalItemCount'),
+        'inbox_unread': inbox.get('UnreadItemCount')}, ensure_ascii=False))
+
+
+def cmd_folders(token):
+    print(json.dumps([{
+        'id': f.get('Id'), 'name': f.get('DisplayName'),
+        'total': f.get('TotalItemCount'), 'unread': f.get('UnreadItemCount')}
+        for f in api_paged('%s/me/mailfolders?$top=100' % API, token)],
+        ensure_ascii=False, indent=1))
+
+
+def cmd_list(token, args):
+    msgs = list_messages(token, args.get('folder', 'inbox'),
+                         int(args.get('top', 20)), 'unread' in args,
+                         args.get('since'))
+    print(json.dumps([msg_view(m) for m in msgs], ensure_ascii=False, indent=1))
+
+
+def cmd_search(token, args):
+    kw = args['keyword'].replace('"', '')
+    top = int(args.get('top', 20))
+    q = urllib.parse.urlencode({'$top': min(top, 100),
+                                '$select': SEL, '$search': '"%s"' % kw})
+    msgs = api_paged('%s/me/messages?%s' % (API, q), token, limit=top)
+    print(json.dumps([msg_view(m) for m in msgs],
+                     ensure_ascii=False, indent=1))
+
+
+def cmd_read(token, args):
+    q = urllib.parse.urlencode({'$select':
+        'Id,Subject,From,ToRecipients,CcRecipients,ReceivedDateTime,'
+        'IsRead,HasAttachments,Body,BodyPreview'})
+    m = api_json('GET', '%s/me/messages/%s?%s' % (
+        API, urllib.parse.quote(args['id'], safe=''), q), token,
+        headers={'Prefer': 'outlook.body-content-type="text"'})
+    body = (m.get('Body') or {}).get('Content', '')
+    if (m.get('Body') or {}).get('ContentType') == 'HTML':
+        body = re.sub(r'<[^>]+>', ' ', body)
+        body = re.sub(r'\s+', ' ', body)
+    if args.get('body_max'):
+        limit = int(args['body_max'])
+        if len(body) > limit:
+            body = body[:limit]
+            truncated = True
+        else:
+            truncated = False
+    else:
+        truncated = False
+    out = {
+        'id': m.get('Id'), 'subject': m.get('Subject'),
+        'from': addr(m.get('From')),
+        'to': [addr(r) for r in m.get('ToRecipients', [])],
+        'cc': [addr(r) for r in m.get('CcRecipients', [])],
+        'received': m.get('ReceivedDateTime'), 'is_read': m.get('IsRead'),
+        'has_attachments': m.get('HasAttachments'), 'body_text': body,
+        'body_truncated': truncated}
+    if m.get('HasAttachments'):
+        out['attachments'] = cmd_attachments_data(token, args['id'])
+    print(json.dumps(out, ensure_ascii=False, indent=1))
+
+
+def cmd_attachments_data(token, mid):
+    data = api_json('GET', '%s/me/messages/%s/attachments' % (
+        API, urllib.parse.quote(mid, safe='')), token)
+    return [{'id': a.get('Id'), 'name': a.get('Name'),
+             'size': a.get('Size'), 'content_type': a.get('ContentType')}
+            for a in data.get('value', [])]
+
+
+def cmd_attachments(token, args):
+    print(json.dumps(cmd_attachments_data(token, args['id']),
+                     ensure_ascii=False, indent=1))
+
+
+def cmd_attachment_get(token, args):
+    status, payload = api('GET', '%s/me/messages/%s/attachments/%s/$value' % (
+        API, urllib.parse.quote(args['id'], safe=''),
+        urllib.parse.quote(args['att'], safe='')), token)
+    with open(args['out'], 'wb') as f:
+        f.write(payload)
+    print(json.dumps({'ok': True, 'saved': args['out'],
+                      'bytes': len(payload)}))
+
+
+def cmd_digest(token, args):
+    inbox = api_json('GET', '%s/me/mailfolders/inbox' % API, token)
+    print(json.dumps({
+        'inbox_total': inbox.get('TotalItemCount'),
+        'inbox_unread': inbox.get('UnreadItemCount'),
+        'new_unread': [msg_view(m) for m in list_messages(
+            token, 'inbox', 40, True, args['since'])],
+        'unread_latest': [msg_view(m) for m in list_messages(
+            token, 'inbox', 40, True)]}, ensure_ascii=False, indent=1))
+
+
+def cmd_calendar(token, args):
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    start = args.get('from') or now.strftime('%Y-%m-%dT%H:%M:%SZ')
+    if args.get('to'):
+        end = args['to']
+    else:
+        days = int(args.get('days', 7))
+        end = (now + timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    q = urllib.parse.urlencode({
+        'startDateTime': start, 'endDateTime': end,
+        '$select': 'Id,Subject,Start,End,Organizer,Location,IsAllDay',
+        '$top': 100})
+    events = api_paged('%s/me/calendarview?%s' % (API, q), token)
+    print(json.dumps([event_view(e) for e in events],
+                     ensure_ascii=False, indent=1))
+
+
+def event_view(e):
+    return {'id': e.get('Id'), 'subject': e.get('Subject'),
+            'start': (e.get('Start') or {}),
+            'end': (e.get('End') or {}),
+            'organizer': addr(e.get('Organizer')),
+            'location': (e.get('Location') or {}).get('DisplayName'),
+            'all_day': e.get('IsAllDay')}
+
+
+def cmd_event(token, args):
+    e = api_json('GET', '%s/me/events/%s' % (
+        API, urllib.parse.quote(args['id'], safe='')), token)
+    print(json.dumps(event_view(e), ensure_ascii=False, indent=1))
+
+
+def cmd_calendars(token, args):
+    cals = api_paged('%s/me/calendars?$select=%s' % (
+        API, 'Id,Name,CanEdit,IsDefaultCalendar'), token)
+    print(json.dumps([{'id': c.get('Id'), 'name': c.get('Name'),
+                       'can_edit': c.get('CanEdit'),
+                       'default': c.get('IsDefaultCalendar')}
+                      for c in cals],
+                     ensure_ascii=False, indent=1))
+
+
+def _event_dt(value, tz):
+    return {'DateTime': value, 'TimeZone': tz}
+
+
+def _attendee_list(spec):
+    return [{'EmailAddress': {'Address': a.strip()}, 'Type': 'Required'}
+            for a in (spec or '').split(',') if a.strip()]
+
+
+def build_event(args):
+    """Validate event-create inputs and build the event dict."""
+    require(args, 'subject', 'start', 'end')
+    start = parse_iso(args['start'], '--start')
+    end = parse_iso(args['end'], '--end')
+    if end <= start:
+        usage('--end must be after --start')
+    tz = args.get('tz', 'China Standard Time')
+    ev = {'Subject': args['subject'],
+          'Start': _event_dt(args['start'], tz),
+          'End': _event_dt(args['end'], tz)}
+    if args.get('location'):
+        ev['Location'] = {'DisplayName': args['location']}
+    if args.get('body') or args.get('body_file'):
+        if args.get('body_file') and not os.path.isfile(args['body_file']):
+            usage('body file not found: %s' % args['body_file'])
+        ev['Body'] = {'ContentType': 'Text', 'Content': _body_arg(args)}
+    if args.get('attendees'):
+        check_emails(args['attendees'], '--attendees')
+        ev['Attendees'] = _attendee_list(args['attendees'])
+    if args.get('all_day'):
+        ev['IsAllDay'] = True
+    return ev
+
+
+def cmd_event_create(token, args):
+    ev = build_event(args)
+    if args.get('dry_run'):
+        preview('event-create', {'event': ev,
+                                 'calendar': args.get('calendar')})
+        return
+    key = journal_guard('event-create', ev, force=bool(args.get('force')))
+    if args.get('calendar'):
+        path = '%s/me/calendars/%s/events' % (
+            API, urllib.parse.quote(args['calendar'], safe=''))
+    else:
+        path = '%s/me/events' % API
+    created = api_json('POST', path, token, ev)
+    journal_done(key)
+    out = event_view(created)
+    out['ok'] = True
+    print(json.dumps(out, ensure_ascii=False, indent=1))
+
+
+def cmd_event_update(token, args):
+    tz = args.get('tz', 'China Standard Time')
+    ev = {}
+    if args.get('subject'):
+        ev['Subject'] = args['subject']
+    if args.get('start'):
+        parse_iso(args['start'], '--start')
+        ev['Start'] = _event_dt(args['start'], tz)
+    if args.get('end'):
+        parse_iso(args['end'], '--end')
+        ev['End'] = _event_dt(args['end'], tz)
+    if args.get('start') and args.get('end'):
+        if parse_iso(args['end'], '--end') <= parse_iso(args['start'],
+                                                         '--start'):
+            usage('--end must be after --start')
+    if args.get('location'):
+        ev['Location'] = {'DisplayName': args['location']}
+    if args.get('body') or args.get('body_file'):
+        if args.get('body_file') and not os.path.isfile(args['body_file']):
+            usage('body file not found: %s' % args['body_file'])
+        ev['Body'] = {'ContentType': 'Text', 'Content': _body_arg(args)}
+    if args.get('attendees'):
+        check_emails(args['attendees'], '--attendees')
+        ev['Attendees'] = _attendee_list(args['attendees'])
+    if not ev:
+        usage('nothing to update: pass at least one field')
+    if args.get('dry_run'):
+        preview('event-update', {'id': args['id'], 'patch': ev})
+        return
+    updated = api_json('PATCH', '%s/me/events/%s' % (
+        API, urllib.parse.quote(args['id'], safe='')), token, ev)
+    out = event_view(updated)
+    out['ok'] = True
+    print(json.dumps(out, ensure_ascii=False, indent=1))
+
+
+def cmd_event_delete(token, args):
+    if args.get('dry_run'):
+        preview('event-delete', {'id': args['id']})
+        return
+    api('DELETE', '%s/me/events/%s' % (
+        API, urllib.parse.quote(args['id'], safe='')), token)
+    print(json.dumps({'ok': True, 'deleted': args['id']},
+                     ensure_ascii=False))
+
+
+def _body_arg(args):
+    if args.get('body_file'):
+        with open(args['body_file']) as f:
+            return f.read()
+    return args.get('body', '')
+
+
+def build_message(args):
+    """Validate send inputs and build the message dict (no API calls)."""
+    require(args, 'to', 'subject')
+    to = check_emails(args['to'], '--to')
+    cc = check_emails(args['cc'], '--cc') if args.get('cc') else []
+    if not (args.get('body') or args.get('body_file')):
+        usage('send needs --body or --body-file')
+    if args.get('body_file') and not os.path.isfile(args['body_file']):
+        usage('body file not found: %s' % args['body_file'])
+    body = _body_arg(args)
+
+    def recips(addrs):
+        return [{'EmailAddress': {'Address': a}} for a in addrs]
+    msg = {'Subject': args['subject'],
+           'Body': {'ContentType': 'Text', 'Content': body},
+           'ToRecipients': recips(to)}
+    if cc:
+        msg['CcRecipients'] = recips(cc)
+    attached = []
+    for path in check_files(args.get('attach')):
+        with open(path, 'rb') as f:
+            raw = f.read()
+        name = os.path.basename(path)
+        msg.setdefault('Attachments', []).append({
+            '@odata.type': '#Microsoft.OutlookServices.FileAttachment',
+            'Name': name, 'ContentBytes': base64.b64encode(raw).decode()})
+        attached.append({'name': name, 'bytes': len(raw)})
+    return msg, attached
+
+
+def cmd_send(token, args):
+    msg, attached = build_message(args)
+    if args.get('dry_run'):
+        body = msg['Body']['Content']
+        preview('send', {
+            'to': [r['EmailAddress']['Address']
+                   for r in msg['ToRecipients']],
+            'cc': [r['EmailAddress']['Address']
+                   for r in msg.get('CcRecipients', [])],
+            'subject': msg['Subject'],
+            'body_preview': body[:200], 'body_chars': len(body),
+            'attachments': attached})
+        return
+    key = journal_guard('send', {
+        'to': msg['ToRecipients'], 'cc': msg.get('CcRecipients', []),
+        'subject': msg['Subject'], 'body': msg['Body']['Content'],
+        'attachments': [a['Name'] for a in msg.get('Attachments', [])]},
+        force=bool(args.get('force')))
+    api('POST', '%s/me/sendmail' % API, token,
+        {'Message': msg, 'SaveToSentItems': True})
+    journal_done(key)
+    print(json.dumps({'ok': True, 'sent_to': args['to'],
+                      'subject': args['subject'],
+                      'attachments': [a['name'] for a in attached]},
+                     ensure_ascii=False))
+
+
+def cmd_reply(token, args):
+    if not (args.get('body') or args.get('body_file')):
+        usage('reply needs --body or --body-file')
+    if args.get('body_file') and not os.path.isfile(args['body_file']):
+        usage('body file not found: %s' % args['body_file'])
+    body = _body_arg(args)
+    if args.get('dry_run'):
+        preview('reply', {'id': args['id'], 'body_preview': body[:200],
+                          'body_chars': len(body)})
+        return
+    api('POST', '%s/me/messages/%s/reply' % (
+        API, urllib.parse.quote(args['id'], safe='')), token,
+        {'Comment': body})
+    print(json.dumps({'ok': True, 'replied_to': args['id']}))
+
+
+def cmd_mark(token, args):
+    if args.get('dry_run'):
+        preview('mark', {'id': args['id'], 'is_read': args['read']})
+        return
+    api('PATCH', '%s/me/messages/%s' % (
+        API, urllib.parse.quote(args['id'], safe='')), token,
+        {'IsRead': args['read']})
+    print(json.dumps({'ok': True, 'id': args['id'],
+                      'is_read': args['read']}))
+
+
+def cmd_move(token, args):
+    require(args, 'folder')
+    if args.get('dry_run'):
+        preview('move', {'id': args['id'], 'to_folder': args['folder']})
+        return
+    dest = resolve_folder_id(token, args['folder'])
+    api('POST', '%s/me/messages/%s/move' % (
+        API, urllib.parse.quote(args['id'], safe='')), token,
+        {'DestinationId': dest})
+    print(json.dumps({'ok': True, 'id': args['id'], 'to': args['folder']}))
+
+
+def cmd_delete(token, args):
+    if args.get('dry_run'):
+        preview('delete', {'id': args['id']})
+        return
+    api('DELETE', '%s/me/messages/%s' % (
+        API, urllib.parse.quote(args['id'], safe='')), token)
+    print(json.dumps({'ok': True, 'deleted': args['id']}))
+
+
+def discover_tenant(auth, domain):
+    status, payload = https(
+        auth, 'GET', '/%s/v2.0/.well-known/openid-configuration' % domain)
+    issuer = json.loads(payload).get('issuer', '')
+    parts = [p for p in issuer.rstrip('/').split('/') if p]
+    # issuer looks like https://<auth-host>/<tenant-guid>/v2.0
+    return parts[-2] if parts and parts[-1] == 'v2.0' else parts[-1]
+
+
+def cmd_auth(args):
+    cloud_name = args.get('cloud') or cfg().get('cloud', '21vianet')
+    prof = CLOUDS[cloud_name]
+    email = args.get('email') or cfg().get('account')
+    if args.get('tenant'):
+        tenant_id = args['tenant']
+    elif email:
+        tenant_id = discover_tenant(prof['auth_host'],
+                                    email.split('@')[-1])
+    elif cfg().get('tenant'):
+        tenant_id = cfg()['tenant']
+    else:
+        raise SystemExit('first run needs --email you@company.com '
+                         '(tenant is auto-discovered from the domain)')
+    scp = '%s/.default offline_access' % prof['resource']
+    body = urllib.parse.urlencode({'client_id': CLIENT_ID, 'scope': scp})
+    status, payload = https(
+        prof['auth_host'], 'POST',
+        '/%s/oauth2/v2.0/devicecode' % tenant_id, body,
+        {'Content-Type': 'application/x-www-form-urlencoded'})
+    dc = json.loads(payload)
+    if status != 200:
+        raise SystemExit('devicecode failed: %s' % payload[:300])
+    print('Open %s and enter code: %s' % (
+        dc.get('verification_uri'), dc['user_code']), flush=True)
+    interval = int(dc.get('interval', 5))
+    deadline = time.time() + int(dc.get('expires_in', 900))
+    while time.time() < deadline:
+        time.sleep(interval)
+        try:
+            status, payload = https(
+                prof['auth_host'], 'POST',
+                '/%s/oauth2/v2.0/token' % tenant_id,
+                urllib.parse.urlencode({
+                    'grant_type': 'urn:ietf:params:oauth:grant-type:device_code',
+                    'client_id': CLIENT_ID, 'device_code': dc['device_code']}),
+                {'Content-Type': 'application/x-www-form-urlencoded'})
+        except ApiError as e:
+            data = json.loads(e.payload)
+            err = data.get('error', '')
+            if err == 'authorization_pending':
+                continue
+            if err == 'slow_down':
+                interval += 2
+                continue
+            raise SystemExit('auth failed: %s' % e.payload[:300])
+        data = json.loads(payload)
+        save_store({'refresh_token': data['refresh_token'],
+                    'tenant': tenant_id, 'cloud': cloud_name,
+                    'account': email})
+        print(json.dumps({'ok': True, 'authorised': True,
+                          'account': email, 'tenant': tenant_id,
+                          'cloud': cloud_name, 'scope': data.get('scope')}))
+        return
+    raise SystemExit('device code expired without authorisation')
+
+
+# ---------------------------------------------------------------- main
+def parse_rest(argv):
+    """Parse [--key value | --flag] pairs plus first positional."""
+    args, pos = {}, []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith('--'):
+            key = a[2:].replace('-', '_')
+            if i + 1 < len(argv) and not argv[i + 1].startswith('--'):
+                args[key] = argv[i + 1]
+                i += 2
+            else:
+                args[key] = True
+                i += 1
+        else:
+            pos.append(a)
+            i += 1
+    return pos, args
+
+
+WRITE_CMDS = {'send', 'reply', 'mark', 'move', 'delete',
+              'event-create', 'event-update', 'event-delete'}
+
+
+def need_pos(pos, n, what):
+    if len(pos) < n:
+        usage('missing argument: %s' % what)
+    return pos
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.stderr.write(__doc__)
+        sys.exit(64)
+    cmd = sys.argv[1]
+    pos, opts = parse_rest(sys.argv[2:])
+    try:
+        if cmd in ('auth', 'reauth'):
+            cmd_auth(opts)
+            return
+        # --dry-run on a write command: validate + preview only,
+        # no token fetch, no API calls, no journal writes.
+        token = None if (cmd in WRITE_CMDS and opts.get('dry_run')) \
+            else access_token()
+        if cmd == 'doctor':
+            cmd_doctor(token)
+        elif cmd == 'folders':
+            cmd_folders(token)
+        elif cmd == 'list':
+            cmd_list(token, opts)
+        elif cmd == 'search':
+            opts['keyword'] = need_pos(pos, 1, 'search keyword')[0]
+            cmd_search(token, opts)
+        elif cmd == 'read':
+            opts['id'] = need_pos(pos, 1, 'message id')[0]
+            cmd_read(token, opts)
+        elif cmd == 'attachments':
+            opts['id'] = need_pos(pos, 1, 'message id')[0]
+            cmd_attachments(token, opts)
+        elif cmd == 'attachment-get':
+            need_pos(pos, 3, 'message id, attachment id, output path')
+            opts.update({'id': pos[0], 'att': pos[1], 'out': pos[2]})
+            cmd_attachment_get(token, opts)
+        elif cmd == 'digest':
+            opts['since'] = need_pos(pos, 1, 'since timestamp (ISO, UTC)')[0]
+            cmd_digest(token, opts)
+        elif cmd == 'calendar':
+            cmd_calendar(token, opts)
+        elif cmd == 'event':
+            opts['id'] = need_pos(pos, 1, 'event id')[0]
+            cmd_event(token, opts)
+        elif cmd == 'calendars':
+            cmd_calendars(token, opts)
+        elif cmd == 'event-create':
+            cmd_event_create(token, opts)
+        elif cmd == 'event-update':
+            opts['id'] = need_pos(pos, 1, 'event id')[0]
+            cmd_event_update(token, opts)
+        elif cmd == 'event-delete':
+            opts['id'] = need_pos(pos, 1, 'event id')[0]
+            cmd_event_delete(token, opts)
+        elif cmd == 'send':
+            cmd_send(token, opts)
+        elif cmd == 'reply':
+            opts['id'] = need_pos(pos, 1, 'message id')[0]
+            cmd_reply(token, opts)
+        elif cmd == 'mark':
+            opts['id'] = need_pos(pos, 1, 'message id')[0]
+            if ('read' in opts) == ('unread' in opts):
+                usage('mark needs exactly one of --read or --unread')
+            opts['read'] = 'read' in opts
+            cmd_mark(token, opts)
+        elif cmd == 'move':
+            opts['id'] = need_pos(pos, 1, 'message id')[0]
+            cmd_move(token, opts)
+        elif cmd == 'delete':
+            opts['id'] = need_pos(pos, 1, 'message id')[0]
+            cmd_delete(token, opts)
+        else:
+            sys.stderr.write('unknown command: %s\n' % cmd)
+            sys.exit(64)
+    except AmbiguousError as e:
+        sys.stderr.write(json.dumps({
+            'error': 'ambiguous_outcome', 'detail': str(e),
+            'hint': 'do not retry blindly: verify whether the write '
+                    'landed (Sent Items / calendar / folder), then '
+                    're-run with --force only if it did not'}) + '\n')
+        sys.exit(3)
+    except ApiError as e:
+        sys.stderr.write(json.dumps({
+            'error': 'api_error', 'status': e.status,
+            'detail': e.payload.decode('utf-8', 'replace')[:400]}) + '\n')
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

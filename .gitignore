@@ -1,0 +1,5 @@
+token_store.json
+write_journal.json
+__pycache__/
+*.pyc
+.omail/
