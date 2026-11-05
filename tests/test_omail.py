@@ -404,8 +404,8 @@ class TestContactsFind(unittest.TestCase):
     def test_people_view_maps_scored_emails(self):
         v = self.m.people_view({
             'DisplayName': '陆杰',
-            'ScoredEmailAddresses': [{'Address': 'jenny.lu@bpsemi.com'}]})
-        self.assertEqual(v['emails'][0]['address'], 'jenny.lu@bpsemi.com')
+            'ScoredEmailAddresses': [{'Address': 'jenny.lu@example.com'}]})
+        self.assertEqual(v['emails'][0]['address'], 'jenny.lu@example.com')
         self.assertEqual(v['source'], 'directory')
 
     def test_matches_reversed_cjk_name_and_email(self):
@@ -449,14 +449,14 @@ class TestContactsFind(unittest.TestCase):
     def test_cmd_find_merges_people_and_contacts(self):
         person = self.m.people_view({
             'DisplayName': '陆杰',
-            'ScoredEmailAddresses': [{'Address': 'jenny.lu@bpsemi.com'}]})
+            'ScoredEmailAddresses': [{'Address': 'jenny.lu@example.com'}]})
         with mock.patch.object(self.m, 'search_people',
                                return_value=[person]), \
                 mock.patch.object(self.m, 'fetch_contacts',
                                   return_value=[]):
             out = capture(self.m.cmd_find, 'tok', {'keyword': '陆杰'})
         d = json.loads(out)
-        self.assertEqual(d[0]['emails'][0]['address'], 'jenny.lu@bpsemi.com')
+        self.assertEqual(d[0]['emails'][0]['address'], 'jenny.lu@example.com')
         self.assertEqual(d[0]['sources'], ['directory'])
 
 
