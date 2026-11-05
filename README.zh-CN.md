@@ -26,6 +26,14 @@
 - Python 3.9+（仅标准库，无需 pip 安装任何东西）
 - 能访问所在云的登录与 API 域名（经代理时自动读取 `https_proxy` / `HTTPS_PROXY` 环境变量，大小写都认）
 
+## 安装
+
+```bash
+pip install git+https://github.com/ryangucheng2022-sudo/omail-cli.git   # 提供 omail 命令
+```
+
+也可以直接 clone 后运行 `bin/omail`——单文件、纯标准库，无需安装。
+
 ## 快速开始
 
 ```bash

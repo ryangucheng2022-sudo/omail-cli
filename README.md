@@ -19,6 +19,14 @@ A single-file, zero-dependency command-line tool for Microsoft 365 mailboxes: fu
 
 If sign-in fails with a local certificate verification error, set `SSL_CERT_FILE` to a trusted CA bundle. When the optional `certifi` package is installed, `omail` uses it automatically if the Python installation has no usable default CA bundle.
 
+## Install
+
+```bash
+pip install git+https://github.com/ryangucheng2022-sudo/omail-cli.git   # provides the `omail` command
+```
+
+Or clone the repo and run `bin/omail` directly — it is a single stdlib-only file; no install needed.
+
 ## Quick start
 
 ```bash

@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omail-cli"
+version = "1.2.2"
+description = "Outlook mailbox CLI for Microsoft 365 (incl. 21Vianet) - device-code auth, read/send/calendar, JSON output for agents"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.setuptools]
+packages = []
