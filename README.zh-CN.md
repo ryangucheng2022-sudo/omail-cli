@@ -15,6 +15,12 @@
 - **写操作安全设计**：发送前参数校验、`--dry-run` 预览模式、幂等防重复（见下）
 - **零依赖**：一个 Python 文件，标准库实现；输出全是 JSON，方便脚本和 AI 智能体调用
 
+## 云支持状态
+
+- **世纪互联（中国）——正式支持**。默认云，Outlook REST API v2.0（partner.outlook.cn），本工具即针对该配置开发与测试。
+- **全球版——旧配置，按现状提供**。`global` 配置指向 outlook.office365.com 的 Outlook REST API v2.0；微软已在全球云弃用该 API 并转向 Microsoft Graph、正在退役，因此该配置随时可能失效，且**未**对当前全球端点做过验证。请当作起点参考，而非受支持配置。
+- Microsoft Graph 后端是未来可能的方向，不属于本版本；当前设计停留在 v2.0 接口面，正是因为「免管理员同意的设备码模式」依赖它尚可用的云。
+
 ## 环境要求
 
 - Python 3.9+（仅标准库，无需 pip 安装任何东西）
@@ -29,7 +35,7 @@ bin/omail auth --email you@yourcompany.com
 bin/omail doctor   # 自检：输出你的账号与收件箱计数即通
 ```
 
-全球版 Microsoft 365：`bin/omail auth --email you@yourcompany.com --cloud global`
+全球版 Microsoft 365（旧配置，见「云支持状态」）：`bin/omail auth --email you@yourcompany.com --cloud global`
 
 租户 ID 会从你的邮箱域名自动发现，无需手填（可用 `--tenant <guid>` 覆盖）。
 

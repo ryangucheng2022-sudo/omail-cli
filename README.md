@@ -4,7 +4,13 @@ English | [简体中文](README.zh-CN.md)
 
 A single-file, zero-dependency command-line tool for Microsoft 365 mailboxes: full mail management (read, search, digest, attachments, send/reply/mark/move/delete) and calendar management (list, create, update, delete), all through the Outlook REST API v2.0.
 
-**Works with** Microsoft 365 global and 21Vianet (China) tenants. **No tenant admin consent required** — it uses the device-code flow with the Microsoft Office first-party application's pre-consented permissions; you sign in once with your own account.
+**Works with** Microsoft 365 tenants — the supported and tested path is the 21Vianet (China) cloud; a legacy global-cloud profile is included (see *Cloud support status* below). **No tenant admin consent required** — it uses the device-code flow with the Microsoft Office first-party application's pre-consented permissions; you sign in once with your own account.
+
+## Cloud support status
+
+- **21Vianet (China) — supported.** Default cloud. Outlook REST API v2.0 at `partner.outlook.cn`; this is the configuration the tool is developed and tested against.
+- **Global cloud — legacy, provided as-is.** The `global` profile targets the Outlook REST API v2.0 at `outlook.office365.com`. Microsoft has deprecated that API on the global cloud in favor of Microsoft Graph and is retiring it, so this profile may stop working at any time and is **not** verified against current global endpoints. Treat it as a starting point, not a supported configuration.
+- A Microsoft Graph backend is a possible future direction; it is not part of this version, and the no-admin-consent device-code model is the reason the current design stays on the v2.0 surface where it remains available.
 
 ## Requirements
 
@@ -22,7 +28,7 @@ bin/omail auth --email you@yourcompany.com
 bin/omail doctor   # health check: prints your account and inbox counts
 ```
 
-Global Microsoft 365: add `--cloud global`. Your tenant ID is auto-discovered from your email domain (override with `--tenant <guid>` if ever needed).
+Global Microsoft 365 (legacy profile, see *Cloud support status*): add `--cloud global`. Your tenant ID is auto-discovered from your email domain (override with `--tenant <guid>` if ever needed).
 
 ## How it works
 
