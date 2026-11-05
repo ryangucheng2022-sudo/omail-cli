@@ -24,6 +24,14 @@ bin/omail doctor   # health check: prints your account and inbox counts
 
 Global Microsoft 365: add `--cloud global`. Your tenant ID is auto-discovered from your email domain (override with `--tenant <guid>` if ever needed).
 
+## How it works
+
+- **Service model.** Everything runs against the Outlook REST API v2.0 on the Microsoft 365 sovereign cloud operated by 21Vianet (`partner.outlook.cn`). No IMAP, EWS, or Graph dependency — one API surface for mail, calendar, and contacts.
+- **Auth model.** OAuth 2.0 device flow using the Microsoft Office first-party client. That choice is deliberate: it needs no app registration and no tenant-admin consent, which is what makes the tool usable inside organizations where custom app registrations are not approved. The refresh token is stored locally with mode 600 and rotated on every refresh; re-authentication is one interactive `reauth` command.
+- **Transport.** HTTP goes through a manual CONNECT tunnel because standard library proxy handling is unreliable behind some corporate egress proxies.
+- **Safety model.** Reads print JSON and change nothing. Writes (`send`, `reply`, `delete`, `event-create`, …) accept `--dry-run` (validate and preview, no API call) and are journal-guarded, so a retried write cannot silently duplicate a sent mail or a created event.
+- **Why a CLI.** After one sign-in, every command is non-interactive and machine-readable — the shape an AI agent (or a cron job) needs to work a mailbox reliably.
+
 ## Commands
 
 Read-only:
